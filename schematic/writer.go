@@ -3,7 +3,9 @@ package schematic
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/binary"
 	"fmt"
+	"io"
 
 	"github.com/Tnze/go-mc/nbt"
 )
@@ -20,9 +22,10 @@ type Schematic struct {
 	// e.g. "minecraft:stone" -> 0, "minecraft:oak_planks" -> 1
 	Palette map[string]int32
 
-	// BlockData stores the palette index for each block position.
+	// blockData stores the palette index for each block position as uint16.
+	// Supports up to 65535 unique block states (practical limit).
 	// Indexed as: x + z*Width + y*Width*Length
-	BlockData []int32
+	blockData []uint16
 
 	BlockEntities []BlockEntity
 	Entities      []Entity
@@ -51,7 +54,7 @@ func NewSchematic(width, height, length int, dataVersion int32) *Schematic {
 		Length:      length,
 		DataVersion: dataVersion,
 		Palette:     map[string]int32{"minecraft:air": 0},
-		BlockData:   make([]int32, totalBlocks),
+		blockData:   make([]uint16, totalBlocks),
 	}
 }
 
@@ -83,7 +86,7 @@ func BlockStateString(name string, properties map[string]string) string {
 func (s *Schematic) SetBlock(x, y, z int, blockState string) {
 	index := x + z*s.Width + y*s.Width*s.Length
 
-	if index < 0 || index >= len(s.BlockData) {
+	if index < 0 || index >= len(s.blockData) {
 		return
 	}
 
@@ -93,86 +96,70 @@ func (s *Schematic) SetBlock(x, y, z int, blockState string) {
 		s.Palette[blockState] = paletteIdx
 	}
 
-	s.BlockData[index] = paletteIdx
+	s.blockData[index] = uint16(paletteIdx)
 }
 
 // Save writes the schematic to gzipped NBT bytes in Sponge Schematic v3 format.
+//
+// NBT is written manually to avoid large intermediate allocations. The block
+// data (often hundreds of MB as varints) is streamed directly from the uint16
+// array into the gzip writer using a small buffer, so peak memory stays close
+// to the size of blockData itself rather than 2-3x.
 func (s *Schematic) Save() ([]byte, error) {
-	// Encode BlockData as varint byte array
-	blockDataBytes := encodeVarIntArray(s.BlockData)
-
-	// Build palette NBT: map[string]int32
-	paletteNBT := make(map[string]int32, len(s.Palette))
-	for k, v := range s.Palette {
-		paletteNBT[k] = v
-	}
-
-	// Build Blocks container
-	blocks := blocksContainerNBT{
-		Palette: paletteNBT,
-		Data:    blockDataBytes,
-	}
-
-	// Build block entities
-	if len(s.BlockEntities) > 0 {
-		beList := make([]blockEntityNBT, len(s.BlockEntities))
-		for i, be := range s.BlockEntities {
-			beList[i] = blockEntityNBT{
-				Pos:  be.Pos,
-				Id:   be.Id,
-				Data: be.Data,
-			}
-		}
-		blocks.BlockEntities = beList
-	}
-
-	// Build entities
-	var entities []entityNBT
-	if len(s.Entities) > 0 {
-		entities = make([]entityNBT, len(s.Entities))
-		for i, ent := range s.Entities {
-			entities[i] = entityNBT{
-				Pos:  ent.Pos,
-				Id:   ent.Id,
-				Data: ent.Data,
-			}
-		}
-	}
-
-	schemNBT := schemRootNBT{
-		Version:     3,
-		DataVersion: s.DataVersion,
-		Width:       int16(s.Width),
-		Height:      int16(s.Height),
-		Length:      int16(s.Length),
-		Offset:      s.Offset,
-		Blocks:      blocks,
-	}
-
-	if len(entities) > 0 {
-		schemNBT.Entities = entities
-	}
-
-	// Wrap in a root compound: {"": {"Schematic": {...}}}
-	// WorldEdit's reader does: LinRootEntry.readFrom(stream).value().getTag("Schematic")
-	// So the root tag must be a nameless compound containing a "Schematic" child.
-	root := struct {
-		Schematic schemRootNBT `nbt:"Schematic"`
-	}{Schematic: schemNBT}
-
-	// Encode to NBT
-	var nbtBuf bytes.Buffer
-	encoder := nbt.NewEncoder(&nbtBuf)
-	if err := encoder.Encode(root, ""); err != nil {
-		return nil, fmt.Errorf("encoding schematic NBT: %w", err)
-	}
-
-	// Compress with gzip
 	var gzBuf bytes.Buffer
 	gzWriter := gzip.NewWriter(&gzBuf)
-	if _, err := gzWriter.Write(nbtBuf.Bytes()); err != nil {
-		return nil, fmt.Errorf("compressing schematic: %w", err)
+	w := &nbtWriter{w: gzWriter}
+
+	// Root compound (empty name — required by WorldEdit/FAWE)
+	w.beginCompound("")
+
+	// Schematic compound
+	w.beginCompound("Schematic")
+	w.writeInt("Version", 3)
+	w.writeInt("DataVersion", s.DataVersion)
+	w.writeShort("Width", int16(s.Width))
+	w.writeShort("Height", int16(s.Height))
+	w.writeShort("Length", int16(s.Length))
+	w.writeIntArray("Offset", s.Offset[:])
+
+	// Blocks compound
+	w.beginCompound("Blocks")
+
+	// Palette — each entry is an Int tag whose name is the block state
+	w.beginCompound("Palette")
+	for name, idx := range s.Palette {
+		w.writeInt(name, idx)
 	}
+	w.endCompound()
+
+	// Data — varint-encoded block data, streamed directly from blockData
+	// This is the critical optimization: no intermediate []byte allocation.
+	w.writeBlockDataVarints("Data", s.blockData)
+	s.blockData = nil // release the 351MB array immediately
+
+	// BlockEntities
+	if len(s.BlockEntities) > 0 {
+		w.writeNamedNBT(struct {
+			BlockEntities []blockEntityNBT `nbt:"BlockEntities"`
+		}{BlockEntities: toBlockEntityNBT(s.BlockEntities)})
+	}
+
+	w.endCompound() // Blocks
+
+	// Entities
+	if len(s.Entities) > 0 {
+		w.writeNamedNBT(struct {
+			Entities []entityNBT `nbt:"Entities"`
+		}{Entities: toEntityNBT(s.Entities)})
+	}
+
+	w.endCompound() // Schematic
+	w.endCompound() // root
+
+	if w.err != nil {
+		return nil, fmt.Errorf("encoding schematic NBT: %w", w.err)
+	}
+
 	if err := gzWriter.Close(); err != nil {
 		return nil, fmt.Errorf("closing gzip writer: %w", err)
 	}
@@ -180,24 +167,148 @@ func (s *Schematic) Save() ([]byte, error) {
 	return gzBuf.Bytes(), nil
 }
 
-// NBT serialization structures for Sponge Schematic v3
+// ---------------------------------------------------------------------------
+// Manual NBT writer — writes raw NBT tags to an io.Writer.
+// Tracks the first error and skips subsequent writes on error.
+// ---------------------------------------------------------------------------
 
-type schemRootNBT struct {
-	Version     int32              `nbt:"Version"`
-	DataVersion int32              `nbt:"DataVersion"`
-	Width       int16              `nbt:"Width"`
-	Height      int16              `nbt:"Height"`
-	Length      int16              `nbt:"Length"`
-	Offset      [3]int32           `nbt:"Offset"`
-	Blocks      blocksContainerNBT `nbt:"Blocks"`
-	Entities    []entityNBT        `nbt:"Entities,omitempty"`
+type nbtWriter struct {
+	w   io.Writer
+	err error
 }
 
-type blocksContainerNBT struct {
-	Palette       map[string]int32 `nbt:"Palette"`
-	Data          []byte           `nbt:"Data"`
-	BlockEntities []blockEntityNBT `nbt:"BlockEntities,omitempty"`
+// NBT tag type IDs
+const (
+	tagEnd       = 0
+	tagByte      = 1
+	tagShort     = 2
+	tagInt       = 3
+	tagFloat     = 5
+	tagDouble    = 6
+	tagByteArray = 7
+	tagString    = 8
+	tagList      = 9
+	tagCompound  = 10
+	tagIntArray  = 11
+)
+
+func (w *nbtWriter) write(data []byte) {
+	if w.err != nil {
+		return
+	}
+	_, w.err = w.w.Write(data)
 }
+
+func (w *nbtWriter) writeBE(v any) {
+	if w.err != nil {
+		return
+	}
+	w.err = binary.Write(w.w, binary.BigEndian, v)
+}
+
+func (w *nbtWriter) writeTagHeader(tagType byte, name string) {
+	w.write([]byte{tagType})
+	w.writeBE(uint16(len(name)))
+	w.write([]byte(name))
+}
+
+func (w *nbtWriter) beginCompound(name string) {
+	w.writeTagHeader(tagCompound, name)
+}
+
+func (w *nbtWriter) endCompound() {
+	w.write([]byte{tagEnd})
+}
+
+func (w *nbtWriter) writeInt(name string, v int32) {
+	w.writeTagHeader(tagInt, name)
+	w.writeBE(v)
+}
+
+func (w *nbtWriter) writeShort(name string, v int16) {
+	w.writeTagHeader(tagShort, name)
+	w.writeBE(v)
+}
+
+func (w *nbtWriter) writeIntArray(name string, v []int32) {
+	w.writeTagHeader(tagIntArray, name)
+	w.writeBE(int32(len(v)))
+	for _, val := range v {
+		w.writeBE(val)
+	}
+}
+
+// writeBlockDataVarints writes an NBT ByteArray tag whose content is the
+// varint encoding of each uint16 in data. The varints are streamed through
+// a small 4 KB buffer so no large intermediate slice is allocated.
+func (w *nbtWriter) writeBlockDataVarints(name string, data []uint16) {
+	if w.err != nil {
+		return
+	}
+
+	// First pass: count the total varint byte length (no allocation).
+	byteLen := int32(0)
+	for _, v := range data {
+		uv := uint32(v)
+		for uv >= 0x80 {
+			byteLen++
+			uv >>= 7
+		}
+		byteLen++
+	}
+
+	// Write tag header + array length
+	w.writeTagHeader(tagByteArray, name)
+	w.writeBE(byteLen)
+
+	// Second pass: encode varints through a small reusable buffer.
+	buf := make([]byte, 0, 4096)
+	for _, v := range data {
+		uv := uint32(v)
+		for uv >= 0x80 {
+			buf = append(buf, byte(uv&0x7F)|0x80)
+			uv >>= 7
+		}
+		buf = append(buf, byte(uv))
+
+		if len(buf) >= 4000 {
+			w.write(buf)
+			buf = buf[:0]
+			if w.err != nil {
+				return
+			}
+		}
+	}
+	if len(buf) > 0 {
+		w.write(buf)
+	}
+}
+
+// writeNamedNBT encodes a struct's fields as NBT tags and injects them into
+// the current compound. It uses go-mc/nbt for complex nested structures
+// (entities, block entities with arbitrary Data maps), then strips the
+// outer compound wrapper that nbt.Encode adds.
+func (w *nbtWriter) writeNamedNBT(v any) {
+	if w.err != nil {
+		return
+	}
+	var buf bytes.Buffer
+	if err := nbt.NewEncoder(&buf).Encode(v, ""); err != nil {
+		w.err = err
+		return
+	}
+	raw := buf.Bytes()
+	// nbt.Encode wraps in: compound-type(1) + name-len(2) + name(0) + ... + end(1)
+	// Strip the 3-byte header and 1-byte trailing End tag to get inner fields.
+	if len(raw) < 4 {
+		return
+	}
+	w.write(raw[3 : len(raw)-1])
+}
+
+// ---------------------------------------------------------------------------
+// NBT helper structs — used only for entity serialization via go-mc/nbt
+// ---------------------------------------------------------------------------
 
 type blockEntityNBT struct {
 	Pos  [3]int32               `nbt:"Pos"`
@@ -211,16 +322,18 @@ type entityNBT struct {
 	Data map[string]interface{} `nbt:"Data,omitempty"`
 }
 
-// encodeVarIntArray encodes an array of int32s as a varint byte array.
-func encodeVarIntArray(values []int32) []byte {
-	buf := make([]byte, 0, len(values)) // at least 1 byte per value
-	for _, v := range values {
-		uv := uint32(v)
-		for uv >= 0x80 {
-			buf = append(buf, byte(uv&0x7F)|0x80)
-			uv >>= 7
-		}
-		buf = append(buf, byte(uv))
+func toBlockEntityNBT(entities []BlockEntity) []blockEntityNBT {
+	out := make([]blockEntityNBT, len(entities))
+	for i, be := range entities {
+		out[i] = blockEntityNBT{Pos: be.Pos, Id: be.Id, Data: be.Data}
 	}
-	return buf
+	return out
+}
+
+func toEntityNBT(entities []Entity) []entityNBT {
+	out := make([]entityNBT, len(entities))
+	for i, e := range entities {
+		out[i] = entityNBT{Pos: e.Pos, Id: e.Id, Data: e.Data}
+	}
+	return out
 }

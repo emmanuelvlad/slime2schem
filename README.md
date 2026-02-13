@@ -97,6 +97,26 @@ func main() {
    //paste
    ```
 
+## Memory Usage
+
+The converter allocates a flat array covering the entire bounding box of the world. Memory usage is determined by the **schematic volume**, not the slime file size:
+
+```
+memory ≈ width × height × length × 2 bytes
+```
+
+Where dimensions are derived from the chunk and section bounding box:
+- **Width** = (maxChunkX − minChunkX + 1) × 16
+- **Length** = (maxChunkZ − minChunkZ + 1) × 16
+- **Height** = (maxSectionY − minSectionY + 1) × 16
+
+For example, a 2.4 MB slime world spanning 39×48 chunks with sections 0–23 produces a 624×384×768 schematic (184M blocks), requiring **~350 MB** of peak memory.
+
+A compact world (e.g. 10×10 chunks, 4 sections tall) would use only ~20 MB regardless of slime file size.
+
+> [!CAUTION]
+> Worlds with sparse vertical content (e.g. a few blocks at Y=0 and Y=368) will force a large height span and high memory usage. Consider trimming extreme sections before conversion if memory is constrained.
+
 ## How it works
 
 1. **Parse** — Reads the `.slime` binary format (zstd-compressed chunk data, sections, block palettes, tile entities, entities)
