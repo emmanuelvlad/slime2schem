@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	SlimeMagic   = 0xB10B
-	SlimeVersion = 0x0D
+	SlimeMagic      = 0xB10B
+	SlimeVersionMin = 0x0C // v12
+	SlimeVersionMax = 0x0D // v13
 
 	FlagPOIChunks  = 1
 	FlagFluidTicks = 2
@@ -65,8 +66,8 @@ func ReadSlimeWorld(data []byte) (*SlimeWorld, error) {
 	if err := binary.Read(r, binary.BigEndian, &version); err != nil {
 		return nil, fmt.Errorf("reading version: %w", err)
 	}
-	if version != SlimeVersion {
-		return nil, fmt.Errorf("unsupported slime version: %d (expected %d)", version, SlimeVersion)
+	if version < SlimeVersionMin || version > SlimeVersionMax {
+		return nil, fmt.Errorf("unsupported slime version: %d (supported: %d-%d)", version, SlimeVersionMin, SlimeVersionMax)
 	}
 
 	if err := binary.Read(r, binary.BigEndian, &world.WorldVersion); err != nil {
@@ -74,8 +75,10 @@ func ReadSlimeWorld(data []byte) (*SlimeWorld, error) {
 	}
 
 	var worldFlags uint8
-	if err := binary.Read(r, binary.BigEndian, &worldFlags); err != nil {
-		return nil, fmt.Errorf("reading world flags: %w", err)
+	if version >= 0x0D { // v13+ added world flags
+		if err := binary.Read(r, binary.BigEndian, &worldFlags); err != nil {
+			return nil, fmt.Errorf("reading world flags: %w", err)
+		}
 	}
 
 	// Read compressed chunks
@@ -101,7 +104,7 @@ func ReadSlimeWorld(data []byte) (*SlimeWorld, error) {
 	}
 
 	// Parse chunks
-	chunks, err := parseChunks(chunksData, worldFlags)
+	chunks, err := parseChunks(chunksData, worldFlags, version)
 	if err != nil {
 		return nil, fmt.Errorf("parsing chunks: %w", err)
 	}
@@ -133,7 +136,7 @@ func decompressZstd(data []byte) ([]byte, error) {
 	return io.ReadAll(decoder)
 }
 
-func parseChunks(data []byte, worldFlags uint8) ([]Chunk, error) {
+func parseChunks(data []byte, worldFlags uint8, version uint8) ([]Chunk, error) {
 	r := bytes.NewReader(data)
 
 	// Read chunk count (first 4 bytes of chunk data)
@@ -146,7 +149,7 @@ func parseChunks(data []byte, worldFlags uint8) ([]Chunk, error) {
 
 	for i := int32(0); i < chunkCount; i++ {
 		startPos := int(int64(len(data)) - int64(r.Len()))
-		chunk, err := parseChunk(r, worldFlags)
+		chunk, err := parseChunk(r, worldFlags, version)
 		if err != nil {
 			endPos := int(int64(len(data)) - int64(r.Len()))
 			return nil, fmt.Errorf("chunk #%d/%d (x=%d z=%d, started at byte %d, failed at byte %d): %w",
@@ -158,7 +161,7 @@ func parseChunks(data []byte, worldFlags uint8) ([]Chunk, error) {
 	return chunks, nil
 }
 
-func parseChunk(r *bytes.Reader, worldFlags uint8) (Chunk, error) {
+func parseChunk(r *bytes.Reader, worldFlags uint8, version uint8) (Chunk, error) {
 	var chunk Chunk
 
 	// Chunk coordinates
@@ -177,7 +180,7 @@ func parseChunk(r *bytes.Reader, worldFlags uint8) (Chunk, error) {
 
 	// Parse sections
 	for i := int32(0); i < sectionCount; i++ {
-		section, err := parseSection(r)
+		section, err := parseSection(r, version)
 		if err != nil {
 			return chunk, fmt.Errorf("parsing section %d: %w", i, err)
 		}
@@ -235,29 +238,48 @@ func parseChunk(r *bytes.Reader, worldFlags uint8) (Chunk, error) {
 	return chunk, nil
 }
 
-func parseSection(r *bytes.Reader) (Section, error) {
+func parseSection(r *bytes.Reader, version uint8) (Section, error) {
 	var section Section
 
-	// Section flags
-	var flags uint8
-	if err := binary.Read(r, binary.BigEndian, &flags); err != nil {
-		return section, fmt.Errorf("reading section flags: %w", err)
-	}
-
-	hasSkyLight := flags&2 != 0
-	hasBlockLight := flags&1 != 0
-
-	// Skip sky light
-	if hasSkyLight {
-		if _, err := r.Seek(2048, io.SeekCurrent); err != nil {
-			return section, fmt.Errorf("skipping sky light: %w", err)
+	if version >= 0x0D {
+		// v13+: single flags bitmask byte (1=blockLight, 2=skyLight)
+		var flags uint8
+		if err := binary.Read(r, binary.BigEndian, &flags); err != nil {
+			return section, fmt.Errorf("reading section flags: %w", err)
 		}
-	}
 
-	// Skip block light
-	if hasBlockLight {
-		if _, err := r.Seek(2048, io.SeekCurrent); err != nil {
-			return section, fmt.Errorf("skipping block light: %w", err)
+		// v13 order: skyLight first, then blockLight
+		if flags&2 != 0 {
+			if _, err := r.Seek(2048, io.SeekCurrent); err != nil {
+				return section, fmt.Errorf("skipping sky light: %w", err)
+			}
+		}
+		if flags&1 != 0 {
+			if _, err := r.Seek(2048, io.SeekCurrent); err != nil {
+				return section, fmt.Errorf("skipping block light: %w", err)
+			}
+		}
+	} else {
+		// v12: two separate booleans, interleaved with data
+		// Order: blockLight boolean + data, then skyLight boolean + data
+		var hasBlockLight uint8
+		if err := binary.Read(r, binary.BigEndian, &hasBlockLight); err != nil {
+			return section, fmt.Errorf("reading block light flag: %w", err)
+		}
+		if hasBlockLight != 0 {
+			if _, err := r.Seek(2048, io.SeekCurrent); err != nil {
+				return section, fmt.Errorf("skipping block light: %w", err)
+			}
+		}
+
+		var hasSkyLight uint8
+		if err := binary.Read(r, binary.BigEndian, &hasSkyLight); err != nil {
+			return section, fmt.Errorf("reading sky light flag: %w", err)
+		}
+		if hasSkyLight != 0 {
+			if _, err := r.Seek(2048, io.SeekCurrent); err != nil {
+				return section, fmt.Errorf("skipping sky light: %w", err)
+			}
 		}
 	}
 

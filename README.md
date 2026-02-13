@@ -6,7 +6,7 @@ The output schematic can be loaded in Minecraft using [WorldEdit](https://engine
 
 ## Features
 
-- Parses SlimeWorld format v13 (AdvancedSlimePaper)
+- Parses SlimeWorld format v12–v13 (AdvancedSlimePaper)
 - Outputs Sponge Schematic v3 (`.schem`)
 - Preserves block states with full property data (no legacy ID mapping)
 - Preserves block entity data (chests, shulker boxes, campfires, decorated pots, etc.)
