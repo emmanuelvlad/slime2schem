@@ -29,6 +29,8 @@ go build -o slime2schem .
 
 ## Usage
 
+### Command Line
+
 ```sh
 slime2schem <world.slime>
 ```
@@ -39,6 +41,51 @@ You can also specify the output path:
 
 ```sh
 slime2schem -input world.slime -output my_build.schem
+```
+
+### Programmatic Usage
+
+```go
+package main
+
+import (
+	"os"
+
+	"github.com/emmanuelvlad/slime2schem/converter"
+	"github.com/emmanuelvlad/slime2schem/slime"
+)
+
+func main() {
+	// Read the .slime file
+	worldData, err := os.ReadFile("world.slime")
+	if err != nil {
+		panic(err)
+	}
+
+	// Parse the SlimeWorld
+	slimeWorld, err := slime.ReadSlimeWorld(worldData)
+	if err != nil {
+		panic(err)
+	}
+
+	// Convert to schematic
+	converted, err := converter.Convert(slimeWorld)
+	if err != nil {
+		panic(err)
+	}
+
+	// Save as .schem
+	schemData, err := converted.Schematic.Save()
+	if err != nil {
+		panic(err)
+	}
+
+	// Write to file
+	err = os.WriteFile("world.schem", schemData, 0644)
+	if err != nil {
+		panic(err)
+	}
+}
 ```
 
 ### Loading in Minecraft
