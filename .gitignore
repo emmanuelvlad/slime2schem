@@ -1,0 +1,6 @@
+# Binary
+slime2schem
+
+# Test/conversion files
+*.slime
+*.schem
