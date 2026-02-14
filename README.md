@@ -4,6 +4,12 @@ Converts [SlimeWorld](https://github.com/InfernalSuite/AdvancedSlimePaper) (`.sl
 
 The output schematic can be loaded in Minecraft using [WorldEdit](https://enginehub.org/worldedit) or [FastAsyncWorldEdit](https://github.com/IntellectualSites/FastAsyncWorldEdit).
 
+### Live version
+
+A hosted web version of this converter is [available here](https://slimetoschem.nb.studio/)
+
+Use the web UI to upload a `.slime` file and download the resulting `.schem` without installing the CLI.
+
 ## Features
 
 - Parses SlimeWorld format v12–v13 (AdvancedSlimePaper)
